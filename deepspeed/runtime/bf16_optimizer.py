@@ -16,9 +16,9 @@ from packaging import version as pkg_version
 from deepspeed.git_version_info import version
 from deepspeed.runtime.utils import (get_global_norm_of_tensors, clip_tensors_by_global_norm, DummyOptim,
                                      align_dense_tensors, all_gather_dp_groups, bwc_tensor_model_parallel_rank,
-                                     is_model_parallel_parameter, see_memory_usage)
+                                     is_model_parallel_parameter, see_memory_usage, graph_process)
 
-from deepspeed.utils import link_hp_params, fragment_address
+from deepspeed.utils import link_hp_params, lazy_init_hp_params_optimizer_state, fragment_address
 from deepspeed.checkpoint import enable_universal_checkpoint
 from deepspeed.checkpoint.constants import (DS_VERSION, PARTITION_COUNT, BASE_OPTIMIZER_STATE,
                                             SINGLE_PARTITION_OF_FP32_GROUPS, CLIP_GRAD, GROUP_PADDINGS,
@@ -37,13 +37,21 @@ class BF16_Optimizer(ZeROOptimizer):
                  norm_type=2,
                  allgather_bucket_size=5000000000,
                  dp_process_group=None,
-                 timers=None):
+                 timers=None,
+                 grad_acc_dtype=None,
+                 graph_harvesting=False,
+                 immediate_grad_update=False):
         super().__init__()
         see_memory_usage('begin bf16_optimizer', force=True)
         self.timers = timers
         self.optimizer = init_optimizer
         self.param_names = param_names
         self.using_real_optimizer = not isinstance(self.optimizer, DummyOptim)
+
+        assert grad_acc_dtype in [torch.float32, torch.bfloat16
+                                  ], f"BF16Optimizer: Unsupported gradient accumulation data type: {grad_acc_dtype}"
+        self.grad_acc_dtype = grad_acc_dtype
+        self.immediate_grad_update = immediate_grad_update
 
         self.clip_grad = clip_grad
         self.norm_type = norm_type
@@ -75,9 +83,8 @@ class BF16_Optimizer(ZeROOptimizer):
         self.fp32_groups_gradient_flat_partition = []
         self.fp32_groups_has_gradients = []
 
-        self.step_count = 0
         self.group_paddings = []
-
+        self.graph_harvesting = graph_harvesting
         if self.using_real_optimizer:
             self._setup_for_real_optimizer()
 
@@ -120,7 +127,8 @@ class BF16_Optimizer(ZeROOptimizer):
             num_elem_list = [t.numel() for t in self.bf16_groups[i]]
 
             # create fp32 gradients
-            self.fp32_groups_gradients_flat.append(torch.zeros_like(self.bf16_groups_flat[i], dtype=torch.float32))
+            self.fp32_groups_gradients_flat.append(
+                torch.zeros_like(self.bf16_groups_flat[i], dtype=self.grad_acc_dtype))
 
             # track individual fp32 gradients for entire model
             fp32_gradients = self._split_flat_tensor(flat_tensor=self.fp32_groups_gradients_flat[i],
@@ -157,8 +165,12 @@ class BF16_Optimizer(ZeROOptimizer):
         self.initialize_optimizer_states()
         see_memory_usage('end initialize_optimizer', force=True)
 
+        if self.immediate_grad_update:
+            self.create_grad_acc_hooks()
+
         # Need optimizer states initialized before linking lp to optimizer state
         self._link_all_hp_params()
+        self._hp_optimizer_states_linked = False
         self._enable_universal_checkpoint()
         self._param_slice_mappings = self._create_param_mapping()
 
@@ -193,8 +205,14 @@ class BF16_Optimizer(ZeROOptimizer):
                            param_group_index=i,
                            partition_start=partition_id * partition_size,
                            partition_size=partition_size,
-                           partition_optimizer_state=self.optimizer.state[flat_hp_partition],
                            dp_group=self.real_dp_process_group[i])
+
+    def _lazy_init_hp_params_optimizer_state(self):
+        if not self._hp_optimizer_states_linked:
+            for i, _ in enumerate(self.optimizer.param_groups):
+                lazy_init_hp_params_optimizer_state(self.bf16_groups[i], self.fp32_groups_flat_partition[i],
+                                                    self.optimizer.state)
+            self._hp_optimizer_states_linked = True
 
     def initialize_optimizer_states(self):
         """Take an optimizer step with zero-valued gradients to allocate internal
@@ -205,9 +223,13 @@ class BF16_Optimizer(ZeROOptimizer):
         """
         for param_partition, grad_partition in zip(self.fp32_groups_flat_partition,
                                                    self.fp32_groups_gradient_flat_partition):
-            param_partition.grad = grad_partition
+            # In case of grad acc dtype different than FP32, need to cast to high precision.
+            param_partition.grad = grad_partition.to(
+                param_partition.dtype) if grad_partition.dtype != param_partition.dtype else grad_partition
 
-        self.optimizer.step()
+        if self.grad_acc_dtype is not torch.float32:
+            for param_partition in self.fp32_groups_flat_partition:
+                param_partition.grad = None
 
         self.clear_hp_grads()
 
@@ -237,7 +259,8 @@ class BF16_Optimizer(ZeROOptimizer):
 
         all_groups_norm = get_global_norm_of_tensors(input_tensors=self.get_grads_for_norm(),
                                                      mpu=self.mpu,
-                                                     norm_type=self.norm_type)
+                                                     norm_type=self.norm_type,
+                                                     use_graph=self.graph_harvesting)
         self._global_grad_norm = all_groups_norm
 
         assert all_groups_norm > 0.
@@ -245,14 +268,17 @@ class BF16_Optimizer(ZeROOptimizer):
             clip_tensors_by_global_norm(input_tensors=self.get_grads_for_norm(for_clipping=True),
                                         max_norm=self.clip_grad,
                                         global_norm=all_groups_norm,
-                                        mpu=self.mpu)
+                                        mpu=self.mpu,
+                                        use_graph=self.graph_harvesting)
 
         self.optimizer.step()
+
+        # We need to link optimizer state after the first step() call
+        self._lazy_init_hp_params_optimizer_state()
 
         self.update_lp_params()
 
         self.clear_hp_grads()
-        self.step_count += 1
 
     def backward(self, loss, update_hp_grads=True, clear_lp_grads=False, **bwd_kwargs):
         """Perform a backward pass and copy the low-precision gradients to the
@@ -270,23 +296,43 @@ class BF16_Optimizer(ZeROOptimizer):
             self.update_hp_grads(clear_lp_grads=clear_lp_grads)
 
     @torch.no_grad()
+    def _update_hp_grad(self, lp, group_idx, param_idx, clear_lp_grads):
+        if lp.grad is None:
+            return
+
+        hp_grad = self.fp32_groups_gradients[group_idx][param_idx]
+        assert hp_grad is not None, \
+            f'high precision param has no gradient, lp param_id = {id(lp)} group_info = [{group_idx}][{param_idx}]'
+
+        hp_grad.data.add_(lp.grad.data.to(hp_grad.dtype).view(hp_grad.shape))
+        lp._hp_grad = hp_grad
+        self.fp32_groups_has_gradients[group_idx][param_idx] = True
+
+        # clear gradients
+        if clear_lp_grads:
+            lp.grad._zero()
+
+    @torch.no_grad()
+    def _update_hp_grads_func(self, clear_lp_grads=False):
+        for i, group in enumerate(self.bf16_groups):
+            for j, lp in enumerate(group):
+                self._update_hp_grad(lp, i, j, clear_lp_grads)
+
+    @torch.no_grad()
     def update_hp_grads(self, clear_lp_grads=False):
+        if self.immediate_grad_update:
+            return
+
+        if self.graph_harvesting:
+            graph_process(False, self._update_hp_grads_func, clear_lp_grads)
+        else:
+            self._update_hp_grads_func(clear_lp_grads)
+        #cpu op
         for i, group in enumerate(self.bf16_groups):
             for j, lp in enumerate(group):
                 if lp.grad is None:
                     continue
-
-                hp_grad = self.fp32_groups_gradients[i][j]
-                assert hp_grad is not None, \
-                    f'high precision param has no gradient, lp param_id = {id(lp)} group_info = [{i}][{j}]'
-
-                hp_grad.data.add_(lp.grad.data.to(hp_grad.dtype).view(hp_grad.shape))
-                lp._hp_grad = hp_grad
                 self.fp32_groups_has_gradients[i][j] = True
-
-                # clear gradients
-                if clear_lp_grads:
-                    lp.grad = None
 
     @torch.no_grad()
     def get_grads_for_reduction(self):
@@ -322,7 +368,8 @@ class BF16_Optimizer(ZeROOptimizer):
             # if i == 0:
             #     print_rank_0(f'{fp32_partition[:10]=}', force=True)
 
-        all_gather_dp_groups(partitioned_param_groups=self.bf16_partitioned_groups,
+        all_gather_dp_groups(groups_flat=self.bf16_groups_flat,
+                             partitioned_param_groups=self.bf16_partitioned_groups,
                              dp_process_group=self.real_dp_process_group,
                              start_alignment_factor=self.nccl_start_alignment_factor,
                              allgather_bucket_size=self.allgather_bucket_size)
@@ -337,7 +384,9 @@ class BF16_Optimizer(ZeROOptimizer):
     def clear_lp_grads(self):
         for group in self.bf16_groups:
             for param in group:
-                param.grad = None
+                if param.grad is not None:
+                    # Using zero_() fixed memory address for graph replay
+                    param.grad.zero_()
 
     def state_dict(self):
         state_dict = {}
@@ -365,7 +414,8 @@ class BF16_Optimizer(ZeROOptimizer):
                         state_dict_list,
                         checkpoint_folder,
                         load_optimizer_states=True,
-                        load_from_fp32_weights=False):
+                        load_from_fp32_weights=False,
+                        load_serial=None):
         if checkpoint_folder:
             self._load_universal_checkpoint(checkpoint_folder, load_optimizer_states, load_from_fp32_weights)
         else:
@@ -413,6 +463,28 @@ class BF16_Optimizer(ZeROOptimizer):
                     #print(f"Loading {self.param_names[lp]} {tp_rank=} {tp_world_size=}")
                     lp.load_hp_checkpoint_state(os.path.join(checkpoint_dir, self.param_names[lp]), tp_rank,
                                                 tp_world_size)
+
+    def accumulate_hp_grads_and_remove_lp(self, lp_param, group_idx, param_idx):
+        assert self.immediate_grad_update
+        self._update_hp_grad(lp_param, group_idx, param_idx, clear_lp_grads=False)
+
+    def create_grad_acc_hooks(self):
+        self.grad_accs = []
+        for i, param_group in enumerate(self.bf16_groups):
+            for j, param in enumerate(param_group):
+                if param.requires_grad:
+
+                    def wrapper(param, i, j):
+                        param_tmp = param.expand_as(param)
+                        grad_acc = param_tmp.grad_fn.next_functions[0][0]
+
+                        def accumulate_hp_grads_and_remove_lp(*notneeded):
+                            self.accumulate_hp_grads_and_remove_lp(param, i, j)
+
+                        grad_acc.register_hook(accumulate_hp_grads_and_remove_lp)
+                        self.grad_accs.append(grad_acc)
+
+                    wrapper(param, i, j)
 
 
 def _get_padded_tensor(src_tensor, size):

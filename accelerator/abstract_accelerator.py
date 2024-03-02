@@ -17,6 +17,18 @@ class DeepSpeedAccelerator(ABC):
     def is_synchronized_device(self):
         ...
 
+    @abc.abstractmethod
+    def use_host_timers(self):
+        ...
+
+    @abc.abstractmethod
+    def resolves_data_dependency(self):
+        ...
+
+    @abc.abstractmethod
+    def handles_memory_backpressure(self):
+        ...
+
     # Device APIs
     @abc.abstractmethod
     def device_name(self, device_index):
@@ -147,6 +159,10 @@ class DeepSpeedAccelerator(ABC):
     def total_memory(self, device_index=None):
         ...
 
+    @abc.abstractmethod
+    def available_memory(self, device_index=None):
+        ...
+
     # Data types
     @abc.abstractmethod
     def is_bf16_supported(self):
@@ -189,6 +205,19 @@ class DeepSpeedAccelerator(ABC):
     def is_triton_supported(self):
         ...
 
+    # Graph operations
+    @abc.abstractmethod
+    def create_graph(self):
+        ...
+
+    @abc.abstractmethod
+    def capture_to_graph(self, graph, pool=None, stream=None):
+        ...
+
+    @abc.abstractmethod
+    def replay_graph(self, graph):
+        ...
+
     # Tensor operations
     @property
     @abc.abstractmethod
@@ -226,7 +255,11 @@ class DeepSpeedAccelerator(ABC):
         ...
 
     @abc.abstractmethod
-    def pin_memory(self, tensor):
+    def pin_memory(self, tensor, align_bytes=1):
+        ...
+
+    @abc.abstractmethod
+    def is_pinned(self, tensor):
         ...
 
     @abc.abstractmethod
@@ -249,4 +282,8 @@ class DeepSpeedAccelerator(ABC):
 
     @abc.abstractmethod
     def build_extension(self):
+        ...
+
+    @abc.abstractmethod
+    def export_envs(self):
         ...

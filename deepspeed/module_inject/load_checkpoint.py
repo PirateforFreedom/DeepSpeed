@@ -249,7 +249,7 @@ def load_model_with_checkpoint(r_module,
                         child = Normalize(dim=ds_shape[-1], dtype=child.weight.dtype, eps=child.eps)
                         setattr(module, name, child)
                     elif child.__class__ in [nn.Linear, ColumnParallelLinear, RowParallelLinear]:
-                        child = LinearLayer(weight_shape=child.weight.shape, bias=child.bias)
+                        child = LinearLayer(weight_shape=child.weight.shape, dtype=child.weight.dtype, bias=child.bias)
                         setattr(module, name, child)
                     elif child.__class__ is OPTLearnedPositionalEmbedding:
                         child = OPTEmbedding(weight_shape=ds_shape)
@@ -276,13 +276,6 @@ def load_model_with_checkpoint(r_module,
                     level + 1)
 
     load_module_recursive(r_module)
-    embedding_weight = None
-
-    for n, p in r_module.named_parameters():
-        if "word_embeddings." in n or "embed_tokens." in n or "wte." in n:
-            embedding_weight = p
-    if embedding_weight is not None and r_module.lm_head.weight.is_meta:
-        r_module.lm_head.weight = embedding_weight
 
     for sd_ in sd:
         del sd_
